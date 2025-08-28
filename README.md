@@ -1,3 +1,344 @@
+[Português do Brasil](#português-do-brasil) | [English](#english)
+
+---
+<br>
+
+## English 🇺🇸
+
+<div id="english"></div>
+
+# AWS Service Deployment Guide with ECS, Docker, and GitLab
+
+This document serves as a complete guide for developers to deploy a new containerized service on AWS, using ECS (Elastic Container Service), Docker, and a CI/CD pipeline with GitLab.
+
+---
+
+### **Prerequisites**
+
+Before you start, ensure you have:
+
+- **Docker** installed on your local machine.
+- **AWS CLI** installed and configured with access credentials.
+- Developer access to the AWS account and the project in GitLab.
+
+---
+
+### **Step 1: Application Containerization**
+
+The first step is to package your application into a Docker image. This is done with two main files: `Dockerfile` and `docker-compose.yml`.
+
+#### **1.1. Dockerfile (For Production)**
+
+The `Dockerfile` is the recipe for building your image. It defines the environment, copies files, installs dependencies, and specifies how the application should run.
+
+**Example `Dockerfile` for a NestJS application:**
+
+```dockerfile
+# Base Stage: Use a lean and secure Node.js image
+FROM node:20-bullseye-slim
+
+# Set the working directory inside the container
+WORKDIR /var/www
+
+# Copy dependency files and install packages
+# This leverages Docker's cache, reinstalling dependencies only if package.json changes
+COPY package*.json ./
+RUN npm install && \
+    npm cache clean --force && \
+    npm cache verify
+
+# Copy the rest of the application code
+COPY . .
+
+# Copy the environment file from CI. In local runs,
+# variables should be injected via 'docker run --env-file'
+COPY .ci_env .env
+
+# Compile the application for production
+RUN npm run build
+
+# Expose the port the application will use inside the container
+EXPOSE 3000
+
+# Command to start the application in production
+CMD ["npm","run","start:prod"]
+```
+
+#### **1.2. docker-compose.yml (For Local Development)**
+
+This file makes it easy to run your container locally, managing networks and environment variables.
+
+**Example `docker-compose.yml`:**
+
+```yaml
+services:
+  api:
+    build:
+      context: .
+    container_name: meili-aprova-api-dev
+    ports:
+      - '3000:3000'
+    volumes:
+      - .:/usr/src/app
+      - /usr/src/app/node_modules
+    command: npm run start:dev
+```
+
+---
+
+### **Step 2: CI/CD Pipeline with `.gitlab-ci.yml`**
+
+This file automates the testing and deployment process whenever there is a push to the repository.
+
+**Example `.gitlab-ci.yml`:**
+
+```yaml
+image: docker:20.10.16
+
+stages:
+  - test
+  - deploy
+  - clean
+
+variables:
+  # --- CONFIGURE THESE VARIABLES ---
+  CI_AWS_ECS_SERVICE: "your-service-name-in-ecs"
+  CI_ECR_REPOSITORY: "your-repository-name-in-ecr"
+  CI_AWS_ECS_CLUSTER: "your-ecs-cluster-name"
+  AWS_DEFAULT_REGION: "us-east-1"
+  # --------------------------------
+
+  CI_ECR_IMAGE: $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/$CI_ECR_REPOSITORY
+
+# Test Job
+test-job:
+  image: node:20-alpine
+  stage: test
+  script:
+    - npm install
+    - npm test
+  only:
+    - homolog # or main/master
+
+# Deploy Job (Build + Push + Update)
+deploy-job:
+  stage: deploy
+  script:
+    # 1. Install and Login to AWS
+    - pip install awscli
+    - export AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query "Account" --output text)
+    - aws ecr get-login-password --region $AWS_DEFAULT_REGION | docker login --username AWS --password-stdin $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com
+
+    # 2. Build and Push the Image to ECR
+    - docker build --tag $CI_ECR_IMAGE:$CI_COMMIT_SHA --tag $CI_ECR_IMAGE:latest .
+    - docker push $CI_ECR_IMAGE:$CI_COMMIT_SHA
+    - docker push $CI_ECR_IMAGE:latest
+
+    # 3. Update the Service in ECS to use the new image
+    - aws ecs update-service --cluster $CI_AWS_ECS_CLUSTER --service $CI_AWS_ECS_SERVICE --force-new-deployment --region $AWS_DEFAULT_REGION
+  only:
+    - homolog # or main/master
+
+# Clean Job (Optional)
+clean-job:
+  stage: clean
+  script:
+    - echo "Cleaning Docker images from runner..."
+    - docker rmi -f $CI_ECR_IMAGE:$CI_COMMIT_SHA
+    - docker rmi -f $CI_ECR_IMAGE:latest
+  allow_failure: true
+  only:
+    - homolog
+```
+
+**Note:** Remember to configure the environment variables (`AWS_ACCESS_KEY_ID`, etc.) in your GitLab project's CI/CD settings.
+
+---
+
+### **Step 3: ECR (Elastic Container Registry) Configuration**
+
+ECR is AWS's private registry for your Docker images.
+
+1. Access the **ECR** service in the AWS console.
+2. Click **"Create repository"**.
+3. Keep the visibility as `Private`.
+4. Give the repository a name (e.g., `my-new-service`). This name must be the same as the one you put in the `CI_ECR_REPOSITORY` variable in your `.gitlab-ci.yml`.
+5. Click **"Create repository"**.
+
+#### **3.1. Pushing an Image Manually via AWS CLI (Optional)**
+
+Before the CI/CD pipeline is working, it can be useful to manually push an image to ECR for testing.
+
+**1. Authenticate Docker with ECR:**
+   Run this command in your terminal to get a temporary login token.
+
+   ```sh
+   aws ecr get-login-password --region <your_region> | docker login --username AWS --password-stdin <your_account_id>.dkr.ecr.<your_region>.amazonaws.com
+   ```
+
+- Replace `<your_region>` (e.g., `us-east-1`) and `<your_account_id>`.
+
+**2. Build your Docker Image:**
+   In the project root, where the `Dockerfile` is, run:
+
+   ```sh
+   docker build -t <repository_name> .
+   ```
+
+**3. Tag the Image for ECR:**
+   The image needs to be tagged with the full URI of your ECR repository.
+
+   ```sh
+   docker tag <repository_name>:latest <your_account_id>.dkr.ecr.<your_region>.amazonaws.com/<repository_name>:latest
+   ```
+
+**4. Push the Image:**
+   Now, push the tagged image to the repository.
+
+   ```sh
+   docker push <your_account_id>.dkr.ecr.<your_region>.amazonaws.com/<repository_name>:latest
+   ```
+
+   After the push, you will see the `latest` image in your repository in the ECR console.
+
+---
+
+### **Step 4: Task Definition Configuration**
+
+The Task Definition is the "blueprint" of your application for ECS.
+
+1. Access the **ECS** service and go to **"Task Definitions"**.
+2. Click **"Create new task definition"**.
+3. **Task definition family**: Give it a name (e.g., `my-new-service-task`).
+4. **Launch type**: Select **EC2**.
+5. **Container details**:
+    - **Name**: Give the container a name (e.g., `my-new-service-container`).
+    - **Image URI**: Paste the URI of your ECR repository, including the `:latest` tag. Ex: `225399513320.dkr.ecr.us-east-1.amazonaws.com/my-new-service:latest`.
+    - **Port mappings**: Add the mapping. **Container port**: `3000`, **Host port**: `0`. Using `0` for the host port allows Docker to choose a free port dynamically, avoiding conflicts.
+6. **Environment variables**: Here you can add the environment variables that your service will need. It is preferable to put the environment variables in GitLab (or equivalent) and inject the variables into the pipeline at the time of the image build.
+7. **Task size**: Define the resources. Start with values like **Task memory: `1024` MiB** and **Task CPU: `512` units**.
+8. Click **"Create"**.
+
+---
+
+### **Step 5: Service Configuration in the ECS Cluster**
+
+The service is responsible for keeping your task running in the cluster.
+
+#### **Flow A: Use an Existing Cluster**
+
+1. Go to your ECS cluster and click the **"Services"** tab.
+2. Click **"Create"**.
+3. **Capacity provider strategy**: Leave the default cluster strategy so that ECS can choose the best instance.
+4. **Task Definition**: Select the "Family" and "Revision" (`LATEST`) of the task you created in the previous step.
+5. **Service name**: Give the service a name (e.g., `my-new-service-service`). This name must be the same as the `CI_AWS_ECS_SERVICE` variable in your `.gitlab-ci.yml`.
+6. Skip the Load Balancing section for now (we'll do that in the next step) and click **"Create"**.
+
+#### **Flow B: Create a New Cluster**
+
+(Usually done by the infrastructure team)
+
+1. In the ECS console, click **"Clusters"** and **"Create Cluster"**.
+2. Choose the **"EC2 Linux + Networking"** template.
+3. Give the cluster a name.
+4. In **"Instance configuration"**, choose the instance type (e.g., `t3.small` or larger), the number of instances, and the SSH key pair.
+5. Configure the VPC and subnets where the instances will be created.
+6. Click **"Create"**.
+
+---
+
+### **Step 6: Load Balancer and Target Group Configuration**
+
+This securely exposes your application to the internet.
+
+#### **Flow A: Use an Existing Load Balancer**
+
+1. Go to **EC2 > Target Groups** and click **"Create target group"**.
+    - **Target type**: `Instance`.
+    - **Name**: `my-new-service-tg`.
+    - **Protocol/Port**: `HTTP` / `80`.
+    - **VPC**: The same as your cluster.
+    - **Health checks**: Configure a health check path (e.g., `/health`). If you don't have one, use `/`.
+    - Click **"Create"**.
+2. Go to **EC2 > Load Balancers**, select your ALB, and go to the **"Listeners"** tab.
+3. Select the listener (e.g., `HTTP: 80` or `HTTPS: 443`) and click **"View/edit rules"**.
+4. Click **"Add rule"** (`+` icon).
+5. **IF (Condition)**: `Host header` is `my-new-service.mydomain.com`.
+6. **THEN (Action)**: `Forward to` and select the Target Group (`my-new-service-tg`) you just created.
+7. Save the rule.
+
+#### **Flow B: Create a New Load Balancer**
+
+1. Go to **EC2 > Load Balancers** and click **"Create Load Balancer"**.
+2. Choose **"Application Load Balancer"**.
+3. Give it a name, choose `internet-facing`, `IPv4`.
+4. Select the VPC and subnets.
+5. Create or select a Security Group that allows traffic on ports 80/443.
+6. Create a Target Group as in Flow A and associate it with the default listener.
+7. Click **"Create"**.
+
+---
+
+### **Step 7: Connect the Service to the Load Balancer**
+
+Now, let's connect everything.
+
+1. Go back to your **Service** in ECS.
+2. Click **"Update"**.
+3. Navigate to the **"Load balancing"** section.
+4. Select **"Application Load Balancer"**.
+5. Choose the correct Load Balancer and listener.
+6. In "Container to load balance", click **"Add to load balancer"** and select your **Target Group** (`my-new-service-tg`).
+7. Click **"Update"**. ECS will automatically register the instances where your task is running in the Target Group.
+
+---
+
+### **Step 8: Domain (DNS) Configuration**
+
+The final step is to point your domain to the Load Balancer.
+
+#### **Flow A: Use AWS Route 53**
+
+1. Go to the **Route 53** service.
+2. Enter the **"Hosted zone"** for your domain (e.g., `mydomain.com`).
+3. Click **"Create record"**.
+    - **Record name**: `my-new-service`.
+    - **Record type**: `A`.
+    - **Alias**: Enable this option.
+    - **Route traffic to**: Choose `Alias to Application and Classic Load Balancer`, select the region, and then select your Load Balancer by its DNS name.
+4. Click **"Create records"**.
+
+#### **Flow B: Use an External DNS (e.g., Cloudflare)**
+
+If your DNS is managed by Cloudflare, the process is slightly different, but just as simple.
+
+**1. Find your Load Balancer's Public DNS (in AWS):**
+
+- Follow the same step as in Flow A to find and copy the **DNS name** of your Load Balancer in the EC2 console. The value will be something like `my-alb-123456789.us-east-1.elb.amazonaws.com`.
+
+**2. Create the DNS Record in Cloudflare:**
+
+   1. Access the **Cloudflare** dashboard and select your domain.
+   2. In the left menu, go to **"DNS" > "Records"**.
+   3. Click **"Add record"**.
+   4. Fill out the new record form:
+       - **Type**: Select `CNAME`. (This is the correct type for pointing a domain to another domain name).
+       - **Name**: Enter only the subdomain (e.g., `my-new-service`).
+       - **Target**: Paste the **DNS name** of your Load Balancer that you copied from AWS here.
+       - **Proxy status**: Keep the status "Proxied" (orange cloud). This enables Cloudflare's CDN and security features for your subdomain.
+   5. Click **"Save"**.
+
+After a few minutes for DNS propagation, your service will be live and accessible via the configured URL, with traffic passing through Cloudflare.
+
+<br>
+
+---
+<br>
+
+## Português do Brasil 🇧🇷
+
+<div id="português-do-brasil"></div>
+
 # Guia de Deploy de Serviços na AWS com ECS, Docker e GitLab
 
 Este documento serve como um guia completo para desenvolvedores implantarem um novo serviço containerizado na AWS, utilizando ECS (Elastic Container Service), Docker e um pipeline de CI/CD com GitLab.
